@@ -104,24 +104,7 @@ class ImageGenerationService:
                     tried_tokens.add(current_token)
                     yielded = False
                     try:
-                        try:
-                            result = await self._stream_app_chat(
-                                token_mgr=token_mgr,
-                                token=current_token,
-                                model_info=model_info,
-                                prompt=prompt,
-                                n=n,
-                                response_format=response_format,
-                                enable_nsfw=enable_nsfw,
-                                chat_format=chat_format,
-                            )
-                        except UpstreamException as app_chat_error:
-                            if rate_limited(app_chat_error):
-                                raise
-                            logger.warning(
-                                "App-chat image stream failed, falling back to ws_imagine: %s",
-                                app_chat_error,
-                            )
+                        if model_info.ws_only:
                             result = await self._stream_ws(
                                 token_mgr=token_mgr,
                                 token=current_token,
@@ -134,6 +117,37 @@ class ImageGenerationService:
                                 enable_nsfw=enable_nsfw,
                                 chat_format=chat_format,
                             )
+                        else:
+                            try:
+                                result = await self._stream_app_chat(
+                                    token_mgr=token_mgr,
+                                    token=current_token,
+                                    model_info=model_info,
+                                    prompt=prompt,
+                                    n=n,
+                                    response_format=response_format,
+                                    enable_nsfw=enable_nsfw,
+                                    chat_format=chat_format,
+                                )
+                            except UpstreamException as app_chat_error:
+                                if rate_limited(app_chat_error):
+                                    raise
+                                logger.warning(
+                                    "App-chat image stream failed, falling back to ws_imagine: %s",
+                                    app_chat_error,
+                                )
+                                result = await self._stream_ws(
+                                    token_mgr=token_mgr,
+                                    token=current_token,
+                                    model_info=model_info,
+                                    prompt=prompt,
+                                    n=n,
+                                    response_format=response_format,
+                                    size=size,
+                                    aspect_ratio=aspect_ratio,
+                                    enable_nsfw=enable_nsfw,
+                                    chat_format=chat_format,
+                                )
                         async for chunk in result.data:
                             yielded = True
                             yield chunk
@@ -183,6 +197,18 @@ class ImageGenerationService:
 
             tried_tokens.add(current_token)
             try:
+                if model_info.ws_only:
+                    return await self._collect_ws(
+                        token_mgr=token_mgr,
+                        token=current_token,
+                        model_info=model_info,
+                        tried_tokens=tried_tokens,
+                        prompt=prompt,
+                        n=n,
+                        response_format=response_format,
+                        aspect_ratio=aspect_ratio,
+                        enable_nsfw=enable_nsfw,
+                    )
                 try:
                     return await self._collect_app_chat(
                         token_mgr=token_mgr,
@@ -256,6 +282,7 @@ class ImageGenerationService:
             n=n,
             enable_nsfw=enable_nsfw,
             max_retries=stream_retries,
+            model_name=model_info.grok_model if model_info.ws_only or model_info.grok_model != model_info.model_id else None,
         )
         processor = ImageWSStreamProcessor(
             model_info.model_id,
@@ -423,6 +450,7 @@ class ImageGenerationService:
                 n=call_target,
                 enable_nsfw=enable_nsfw,
                 max_retries=stream_retries,
+                model_name=model_info.grok_model if model_info.ws_only or model_info.grok_model != model_info.model_id else None,
             )
             processor = ImageWSCollectProcessor(
                 model_info.model_id,

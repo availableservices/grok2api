@@ -75,8 +75,12 @@ class AssetsUploadReverse:
                     impersonate=browser,
                 )
                 if response.status_code != 200:
+                    try:
+                        body = response.text[:500].replace("{", "{{").replace("}", "}}")
+                    except Exception:
+                        body = "<unreadable>"
                     logger.error(
-                        f"AssetsUploadReverse: Upload failed, {response.status_code}",
+                        f"AssetsUploadReverse: Upload failed, {response.status_code}, body={body}",
                         extra={"error_type": "UpstreamException"},
                     )
                     raise UpstreamException(
@@ -107,8 +111,9 @@ class AssetsUploadReverse:
                 raise
 
             # Handle other non-upstream exceptions
+            err_str = str(e).replace("{", "{{").replace("}", "}}")
             logger.error(
-                f"AssetsUploadReverse: Upload failed, {str(e)}",
+                f"AssetsUploadReverse: Upload failed, {err_str}",
                 extra={"error_type": type(e).__name__},
             )
             raise UpstreamException(

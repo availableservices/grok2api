@@ -51,6 +51,15 @@ class DownloadService:
             await self._session.close()
             self._session = None
 
+    @staticmethod
+    def _detect_base_url() -> str:
+        """Auto-detect server base URL from environment for local file serving."""
+        host = os.getenv("SERVER_HOST", "0.0.0.0")
+        port = os.getenv("SERVER_PORT", "8000")
+        if host in ("0.0.0.0", ""):
+            host = "127.0.0.1"
+        return f"http://{host}:{port}"
+
     async def resolve_url(
         self, path_or_url: str, token: str, media_type: str = "image"
     ) -> str:
@@ -68,6 +77,21 @@ class DownloadService:
             asset_url = f"https://assets.grok.com{path_or_url}"
 
         app_url = get_config("app.app_url")
+
+        # For video: always download to local cache so the file is viewable.
+        # Use app_url if configured, otherwise auto-detect from env vars.
+        if media_type == "video":
+            if parsed and parsed.netloc and parsed.netloc != "assets.grok.com":
+                return asset_url
+            base_url = (app_url or "").rstrip("/") or self._detect_base_url()
+            try:
+                await self.download_file(asset_url, token, media_type)
+                return f"{base_url}/v1/files/{media_type}{path}"
+            except Exception as e:
+                logger.warning(f"Video download failed, returning CDN URL: {e}")
+                return asset_url
+
+        # For images: only download if app_url is configured
         if app_url:
             if parsed and parsed.netloc and parsed.netloc != "assets.grok.com":
                 return asset_url

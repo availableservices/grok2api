@@ -3,6 +3,7 @@ Reverse interface: Imagine WebSocket image stream.
 """
 
 import asyncio
+import base64
 import orjson
 import re
 import time
@@ -13,7 +14,7 @@ import aiohttp
 
 from app.core.config import get_config
 from app.core.logger import logger
-from app.services.reverse.utils.headers import build_ws_headers
+from app.services.reverse.utils.headers import build_ws_headers, build_sso_cookie
 from app.services.reverse.utils.websocket import WebSocketClient
 
 WS_IMAGINE_URL = "wss://grok.com/ws/imagine/listen"
@@ -67,7 +68,20 @@ class ImagineWebSocketReverse:
             "is_final": is_final,
         }
 
-    def _build_request_message(self, request_id: str, prompt: str, aspect_ratio: str, enable_nsfw: bool) -> Dict[str, object]:
+    def _build_request_message(self, request_id: str, prompt: str, aspect_ratio: str, enable_nsfw: bool, model_name: Optional[str] = None) -> Dict[str, object]:
+        properties: Dict[str, object] = {
+            "section_count": 0,
+            "is_kids_mode": False,
+            "enable_nsfw": enable_nsfw,
+            "skip_upsampler": False,
+            "enable_side_by_side": True,
+            "is_initial": False,
+            "aspect_ratio": aspect_ratio,
+        }
+        if model_name == "imagine-x-1":
+            properties["enable_pro"] = True
+        if model_name:
+            properties["model_name"] = model_name
         return {
             "type": "conversation.item.create",
             "timestamp": int(time.time() * 1000),
@@ -78,18 +92,38 @@ class ImagineWebSocketReverse:
                         "requestId": request_id,
                         "text": prompt,
                         "type": "input_text",
-                        "properties": {
-                            "section_count": 0,
-                            "is_kids_mode": False,
-                            "enable_nsfw": enable_nsfw,
-                            "skip_upsampler": False,
-                            "is_initial": False,
-                            "aspect_ratio": aspect_ratio,
-                        },
+                        "properties": properties,
                     }
                 ],
             },
         }
+
+    async def _fetch_blob_from_cdn(self, url: str, token: str) -> str:
+        """Fetch image from CDN URL and return as base64 data URI."""
+        if url.startswith("/"):
+            url = f"https://assets.grok.com{url}"
+        try:
+            user_agent = get_config("proxy.user_agent") or ""
+            headers = {
+                "Cookie": build_sso_cookie(token),
+                "User-Agent": user_agent,
+                "Accept": "image/*,*/*",
+                "Referer": "https://grok.com/",
+                "Cache-Control": "no-cache",
+            }
+            timeout = aiohttp.ClientTimeout(total=60)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url, headers=headers) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"CDN fetch failed: {resp.status} for {url}")
+                        return ""
+                    content = await resp.read()
+                    ct = resp.content_type or "image/jpeg"
+                    b64 = base64.b64encode(content).decode()
+                    return f"data:{ct};base64,{b64}"
+        except Exception as e:
+            logger.warning(f"CDN fetch error for {url}: {e}")
+            return ""
 
     async def stream(
         self,
@@ -99,6 +133,7 @@ class ImagineWebSocketReverse:
         n: int = 1,
         enable_nsfw: bool = True,
         max_retries: Optional[int] = None,
+        model_name: Optional[str] = None,
     ) -> AsyncGenerator[Dict[str, object], None]:
         retries = max(1, max_retries if max_retries is not None else 1)
         parallel_enabled = bool(get_config("image.blocked_parallel_enabled", True))
@@ -109,7 +144,7 @@ class ImagineWebSocketReverse:
         async def _collect_once() -> list[Dict[str, object]]:
             items: list[Dict[str, object]] = []
             async for item in self._stream_once(
-                token, prompt, aspect_ratio, n, enable_nsfw
+                token, prompt, aspect_ratio, n, enable_nsfw, model_name
             ):
                 items.append(item)
             return items
@@ -175,6 +210,7 @@ class ImagineWebSocketReverse:
         aspect_ratio: str,
         n: int,
         enable_nsfw: bool,
+        model_name: Optional[str] = None,
     ) -> AsyncGenerator[Dict[str, object], None]:
         request_id = str(uuid.uuid4())
         headers = build_ws_headers(token=token)
@@ -214,7 +250,7 @@ class ImagineWebSocketReverse:
         try:
             async with conn as ws:
                 message = self._build_request_message(
-                    request_id, prompt, aspect_ratio, enable_nsfw
+                    request_id, prompt, aspect_ratio, enable_nsfw, model_name
                 )
                 await ws.send_json(message)
                 logger.info(f"WebSocket request sent: {prompt[:80]}...")
@@ -223,6 +259,9 @@ class ImagineWebSocketReverse:
                 completed = 0
                 start_time = last_activity = time.monotonic()
                 medium_received_time: Optional[float] = None
+                # For ws_only models (e.g. imagine-x-1): buffer latest blob per image_id,
+                # only finalize when type:"json" completion signal arrives.
+                pending_blobs: Dict[str, Dict[str, object]] = {}
 
                 while time.monotonic() - start_time < timeout:
                     try:
@@ -270,14 +309,22 @@ class ImagineWebSocketReverse:
                             if info["stage"] == "medium" and medium_received_time is None:
                                 medium_received_time = time.monotonic()
 
-                            if info["is_final"] and image_id not in final_ids:
-                                final_ids.add(image_id)
-                                completed += 1
-                                logger.debug(
-                                    f"Final image received: id={image_id}, size={info['blob_size']}"
-                                )
-
-                            yield info
+                            if model_name:
+                                # For ws_only models: never finalize by blob size alone.
+                                # Buffer the latest blob; finalize only on type:"json" completion.
+                                info["is_final"] = False
+                                if info["stage"] == "final":
+                                    info["stage"] = "medium"
+                                pending_blobs[image_id] = info
+                                yield info
+                            else:
+                                if info["is_final"] and image_id not in final_ids:
+                                    final_ids.add(image_id)
+                                    completed += 1
+                                    logger.debug(
+                                        f"Final image received: id={image_id}, size={info['blob_size']}"
+                                    )
+                                yield info
 
                         elif msg_type == "error":
                             logger.warning(
@@ -289,6 +336,78 @@ class ImagineWebSocketReverse:
                                 "error": msg.get("err_msg", ""),
                             }
                             return
+
+                        elif msg_type == "json":
+                            # imagine-x-1 sends progress/completion as type:"json"
+                            status = str(msg.get("current_status") or "")
+                            pct = float(msg.get("percentage_complete") or 0.0)
+                            image_id = str(msg.get("image_id") or msg.get("job_id") or "")
+                            blob = msg.get("blob", "")
+                            url = msg.get("url", "")
+
+                            logger.debug(
+                                f"imagine-x-1 progress: status={status}, "
+                                f"pct={pct:.1f}%, image_id={image_id}"
+                            )
+
+                            # Mark that generation has started (for blocked detection)
+                            if pct > 0 and medium_received_time is None:
+                                medium_received_time = time.monotonic()
+
+                            is_complete = (
+                                status in ("completed", "done", "finished") or pct >= 100.0
+                            )
+
+                            if blob or url:
+                                # Image data directly in the JSON message
+                                info = self._classify_image(url, blob, final_min_bytes, medium_min_bytes)
+                                if info:
+                                    if info["stage"] == "medium" and medium_received_time is None:
+                                        medium_received_time = time.monotonic()
+                                    if info["is_final"] and info["image_id"] not in final_ids:
+                                        final_ids.add(info["image_id"])
+                                        completed += 1
+                                        logger.debug(
+                                            f"Final image from JSON: id={info['image_id']}, "
+                                            f"size={info['blob_size']}"
+                                        )
+                                    yield info
+                            elif is_complete and image_id and image_id not in final_ids:
+                                # Job complete — finalize from buffered blob if available
+                                if image_id in pending_blobs:
+                                    final_info = dict(pending_blobs.pop(image_id))
+                                    final_info["is_final"] = True
+                                    final_info["stage"] = "final"
+                                    final_ids.add(image_id)
+                                    completed += 1
+                                    logger.debug(
+                                        f"Final image from buffer: id={image_id}, "
+                                        f"size={final_info['blob_size']}"
+                                    )
+                                    yield final_info
+                                else:
+                                    # No buffered blob — fallback to CDN
+                                    asset_url = f"https://assets.grok.com/images/{image_id}.jpg"
+                                    logger.info(
+                                        f"imagine-x-1 job completed, fetching from CDN: {asset_url}"
+                                    )
+                                    cdn_blob = await self._fetch_blob_from_cdn(asset_url, token)
+                                    if cdn_blob:
+                                        info = self._classify_image(asset_url, cdn_blob, 0, 0)
+                                        if info:
+                                            info["is_final"] = True
+                                            info["stage"] = "final"
+                                            final_ids.add(image_id)
+                                            completed += 1
+                                            logger.debug(
+                                                f"Final image from CDN: id={image_id}, "
+                                                f"size={info['blob_size']}"
+                                            )
+                                            yield info
+                                    else:
+                                        logger.warning(
+                                            f"CDN fetch returned empty for image_id={image_id}"
+                                        )
 
                         if completed >= n:
                             logger.info(f"WebSocket collected {completed} final images")

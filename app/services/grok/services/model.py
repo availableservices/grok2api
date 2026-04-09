@@ -36,6 +36,7 @@ class ModelInfo(BaseModel):
     is_image: bool = False
     is_image_edit: bool = False
     is_video: bool = False
+    ws_only: bool = False  # Skip app-chat, go directly to WebSocket
 
 
 class ModelService:
@@ -164,6 +165,19 @@ class ModelService:
             is_video=False,
         ),
         ModelInfo(
+            model_id="imagine-x-1",
+            grok_model="imagine-x-1",
+            model_mode="MODEL_MODE_FAST",
+            tier=Tier.SUPER,
+            cost=Cost.HIGH,
+            display_name="Grok Imagine X-1",
+            description="New Grok image generation model (imagine-x-1)",
+            is_image=True,
+            is_image_edit=False,
+            is_video=False,
+            ws_only=True,
+        ),
+        ModelInfo(
             model_id="grok-imagine-1.0-fast",
             grok_model="grok-3",
             model_mode="MODEL_MODE_FAST",
@@ -203,7 +217,7 @@ class ModelService:
             model_id="grok-imagine-1.0-video",
             grok_model="grok-3",
             model_mode="MODEL_MODE_FAST",
-            tier=Tier.BASIC,
+            tier=Tier.SUPER,
             cost=Cost.HIGH,
             display_name="Grok Video",
             description="Video generation model",

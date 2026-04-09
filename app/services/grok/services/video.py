@@ -173,6 +173,34 @@ async def _create_public_video_link(token: str, video_url: str) -> str:
     return video_url
 
 
+async def _recover_video_url(token: str, post_id: str) -> Optional[str]:
+    """Fallback: poll MediaPostLink to recover video URL when stream closes without one."""
+    poll_interval = 3.0
+    max_attempts = 10
+    for attempt in range(1, max_attempts + 1):
+        try:
+            async with _new_session() as session:
+                response = await MediaPostLinkReverse.request(session, token, post_id)
+            payload = response.json() if response is not None else {}
+            if isinstance(payload, dict):
+                share_link = _pick_str(payload.get("shareLink"))
+                if share_link and share_link.endswith(".mp4"):
+                    logger.info(f"Video URL recovered (attempt {attempt}): {share_link}")
+                    return share_link
+                if share_link:
+                    url = f"https://imagine-public.x.ai/imagine-public/share-videos/{post_id}.mp4?cache=1"
+                    logger.info(f"Video URL recovered via CDN (attempt {attempt}): {url}")
+                    return url
+        except Exception as e:
+            logger.warning(f"Video URL recovery attempt {attempt} failed: {e}")
+
+        if attempt < max_attempts:
+            await asyncio.sleep(poll_interval)
+
+    logger.warning(f"Video URL recovery exhausted after {max_attempts} attempts for post_id={post_id}")
+    return None
+
+
 def _build_mode_flag(preset: str) -> str:
     mode_map = {
         "fun": "--mode=extremely-crazy",
@@ -508,6 +536,7 @@ async def _collect_round_result(
     *,
     model: str,
     source: str,
+    token: Optional[str] = None,
 ) -> VideoRoundResult:
     result = VideoRoundResult()
     async for event_type, payload in _iter_round_events(
@@ -515,6 +544,16 @@ async def _collect_round_result(
     ):
         if event_type == "done":
             result = payload
+
+    # Fallback: stream closed without videoUrl but we have post_id → poll for it
+    if token and result.post_id and not result.video_url:
+        logger.warning(
+            f"Stream closed without videoUrl, recovering via post_id={result.post_id}"
+        )
+        recovered = await _recover_video_url(token, result.post_id)
+        if recovered:
+            result.video_url = recovered
+
     return result
 
 
@@ -957,6 +996,10 @@ class VideoService:
 
             target_length = int(video_length or 6)
             round_plan = _build_round_plan(target_length, is_super=is_super_pool)
+            logger.info(
+                f"Video round plan: target={target_length}s, rounds={len(round_plan)}, "
+                f"pool={pool_name}, resolution={generation_resolution}"
+            )
 
             prompt_text = prompt
             image_urls: List[str] = []
@@ -1025,7 +1068,7 @@ class VideoService:
                         file_attachments=asset_ids if plan.round_index == 1 else None,
                     )
                     return await _collect_round_result(
-                        response, model=model, source=source
+                        response, model=model, source=source, token=token
                     )
 
                 async def _stream_chain() -> AsyncGenerator[str, None]:
@@ -1073,6 +1116,15 @@ class VideoService:
                                         yield chunk
                                 elif event_type == "done":
                                     round_result = payload
+
+                            # Fallback: recover video URL if stream closed without one
+                            if round_result.post_id and not round_result.video_url:
+                                logger.warning(
+                                    f"Stream closed without videoUrl (stream), recovering via post_id={round_result.post_id}"
+                                )
+                                recovered = await _recover_video_url(token, round_result.post_id)
+                                if recovered:
+                                    round_result.video_url = recovered
 
                             _ensure_round_result(
                                 round_result,
