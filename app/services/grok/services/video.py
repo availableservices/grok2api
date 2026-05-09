@@ -201,6 +201,26 @@ async def _recover_video_url(token: str, post_id: str) -> Optional[str]:
     return None
 
 
+async def _recover_final_round_video_url(
+    token: str,
+    fallback_post_ids: List[Optional[str]],
+) -> Tuple[Optional[str], Optional[str]]:
+    """Best-effort recovery for final extension round when stream omits both post_id and video_url."""
+    seen: set[str] = set()
+    for candidate in fallback_post_ids:
+        candidate_id = _pick_str(candidate)
+        if not candidate_id or candidate_id in seen:
+            continue
+        seen.add(candidate_id)
+        logger.warning(
+            f"Attempting final-round video recovery via fallback post_id={candidate_id}"
+        )
+        recovered = await _recover_video_url(token, candidate_id)
+        if recovered:
+            return candidate_id, recovered
+    return None, None
+
+
 def _build_mode_flag(preset: str) -> str:
     mode_map = {
         "fun": "--mode=extremely-crazy",
@@ -268,7 +288,9 @@ def _build_extension_config(
 def _choose_round_length(target_length: int, *, is_super: bool) -> int:
     if not is_super:
         return 6
-    return 10 if target_length >= 10 else 6
+    # Super pool is stable on 10s chunks. For 7-10s requests, generate a single
+    # 10s round and let downstream consumers trim to the requested duration.
+    return 10 if target_length > 6 else 6
 
 
 def _build_round_plan(target_length: int, *, is_super: bool) -> List[VideoRoundPlan]:
@@ -582,6 +604,26 @@ def _ensure_round_result(
     final_round: bool,
 ):
     if not result.post_id:
+        if final_round and result.video_url:
+            logger.warning(
+                "Final video round completed without post_id; accepting video_url result"
+            )
+            return
+
+        logger.warning(
+            "Video round result missing post_id",
+            extra={
+                "round_index": round_index,
+                "total_rounds": total_rounds,
+                "final_round": final_round,
+                "has_video_url": bool(result.video_url),
+                "last_progress": result.last_progress,
+                "stream_errors": result.stream_errors,
+                "response_id": result.response_id,
+                "saw_video_event": result.saw_video_event,
+            },
+        )
+
         err_type = (
             "moderated_or_stream_errors" if result.stream_errors else "missing_post_id"
         )
@@ -995,7 +1037,17 @@ class VideoService:
             upscale_timing = _resolve_upscale_timing() if should_upscale else "complete"
 
             target_length = int(video_length or 6)
+            is_reference = bool(image_attachments)
             round_plan = _build_round_plan(target_length, is_super=is_super_pool)
+            if is_reference and len(round_plan) > 1:
+                # Reference-to-video (isReferenceToVideo) does not support multi-round
+                # extension: the extension stream returns neither post_id nor video_url.
+                # Cap to a single generation round, matching generate_from_images behavior.
+                round_plan = round_plan[:1]
+                logger.info(
+                    f"Reference video: capping to single round "
+                    f"(target={target_length}s, single_round={round_plan[0].video_length}s)"
+                )
             logger.info(
                 f"Video round plan: target={target_length}s, rounds={len(round_plan)}, "
                 f"pool={pool_name}, resolution={generation_resolution}"
@@ -1126,6 +1178,19 @@ class VideoService:
                                 if recovered:
                                     round_result.video_url = recovered
 
+                            if (
+                                plan.round_index == plan.total_rounds
+                                and not round_result.post_id
+                                and not round_result.video_url
+                            ):
+                                recovered_post_id, recovered_url = await _recover_final_round_video_url(
+                                    token,
+                                    [last_id, original_id, seed_id],
+                                )
+                                if recovered_url:
+                                    round_result.post_id = recovered_post_id
+                                    round_result.video_url = recovered_url
+
                             _ensure_round_result(
                                 round_result,
                                 round_index=plan.round_index,
@@ -1225,6 +1290,19 @@ class VideoService:
                             original_id=original_id,
                             source=f"collect-round-{plan.round_index}",
                         )
+
+                        if (
+                            plan.round_index == plan.total_rounds
+                            and not round_result.post_id
+                            and not round_result.video_url
+                        ):
+                            recovered_post_id, recovered_url = await _recover_final_round_video_url(
+                                token,
+                                [last_id, original_id, seed_id],
+                            )
+                            if recovered_url:
+                                round_result.post_id = recovered_post_id
+                                round_result.video_url = recovered_url
 
                         _ensure_round_result(
                             round_result,
