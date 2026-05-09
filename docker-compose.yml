@@ -31,8 +31,8 @@ services:
         granian --interface asgi --host "$${SERVER_HOST:-0.0.0.0}"
         --port "$${SERVER_PORT:-8000}" --workers "$${SERVER_WORKERS:-1}" main:app
     volumes:
-      - ./data:/app/data
-      - ./logs:/app/logs
+      - grok-data:/app/data
+      - grok-logs:/app/logs
     restart: unless-stopped
 
   # 如果出口 IP 不干净，可取消以下注释使用 Warp 作为落地代理
@@ -58,3 +58,7 @@ services:
       TZ: Asia/Shanghai
       LOG_LEVEL: info
     restart: unless-stopped
+
+volumes:
+  grok-data:
+  grok-logs:
